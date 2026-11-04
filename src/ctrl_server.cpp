@@ -2,38 +2,44 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
+#include <functional>
 #include <stdexcept>
 
 namespace
 {
-constexpr double kTwoPi = 6.28318530717958647692;
+constexpr double kTwoPi = 2 * M_PI;
+constexpr double kRequestInterval = 2.0;
 }
 
 ctrl_server::ctrl_server(
     std::shared_ptr<rclcpp::Node> node
 ): _node(node)
 {
-    std::cout << "=== GIMBAL CTRL DRIVER INIT ===" << std::endl;
-    std::cout << "NODE NAME: " << this->_node->get_name() << std::endl;    
-
-    hover_z = _node->declare_parameter<double>("hover_z", 1.5);
-    if (hover_z <= 0.0) {
-        throw std::invalid_argument("hover_z must be greater than 0.0 metres");
+    hover_z = _node->declare_parameter<double>(
+        "hover.z", _node->declare_parameter<double>("hover_z", 1.5));
+    if (!std::isfinite(hover_z) || hover_z <= 0.0) {
+        throw std::invalid_argument("Hover altitude must be finite and greater than 0.0 metres");
     }
     load_trajectory_parameters();
 
+    auto mavros_namespace = _node->declare_parameter<std::string>("mavros_namespace", "/mavros");
+    const auto first = mavros_namespace.find_first_not_of('/');
+    mavros_namespace = first == std::string::npos ? "" : "/" + mavros_namespace.substr(first);
+    while (!mavros_namespace.empty() && mavros_namespace.back() == '/') {
+        mavros_namespace.pop_back();
+    }
+    RCLCPP_INFO(_node->get_logger(), "MAVROS namespace: %s",
+        mavros_namespace.empty() ? "/" : mavros_namespace.c_str());
+
     arming_client = _node->create_client<mavros_msgs::srv::CommandBool>(
-        "/mavros/cmd/arming"
+        mavros_namespace + "/cmd/arming"
     );
 
     set_mode_client = _node->create_client<mavros_msgs::srv::SetMode>(
-        "/mavros/set_mode"
-    );        
-    rclcpp::on_shutdown([this]() {
-        RCLCPP_WARN(_node->get_logger(), "CTRL + C DETECTED -> LAND");
-        land();
-    });
+        mavros_namespace + "/set_mode"
+    );
 
     auto qos_mavros_pose =
     rclcpp::QoS(rclcpp::KeepLast(10))
@@ -41,41 +47,56 @@ ctrl_server::ctrl_server(
         .durability_volatile();
 
     pose_sub = _node->create_subscription<geometry_msgs::msg::PoseStamped>(
-        "/mavros/local_position/pose",
+        mavros_namespace + "/local_position/pose",
         qos_mavros_pose,
         std::bind(&ctrl_server::pose_callback, this, std::placeholders::_1)
     );
 
     mavros_state_sub = _node->create_subscription<mavros_msgs::msg::State>(
-        "/mavros/state",
+        mavros_namespace + "/state",
         10,
         std::bind(&ctrl_server::state_callback, this, std::placeholders::_1)
     );
 
     pose_desired_pub = _node->create_publisher<geometry_msgs::msg::PoseStamped>(
-        "/mavros/setpoint_position/local",
+        mavros_namespace + "/setpoint_position/local",
         10
     );
 
-    set_prerequisite();
-
     heartbeat_timer = _node->create_wall_timer(
-        std::chrono::milliseconds(50), // 20 Hz -> 1000 ms/20 = 50 ms
+        std::chrono::milliseconds(50), // 20 Hz
         std::bind(&ctrl_server::heartbeat_timer_callback, this)
     );
+
+    shutdown_callback = _node->get_node_base_interface()->get_context()->add_pre_shutdown_callback(
+        [client = set_mode_client, logger = _node->get_logger()]() {
+            try {
+                if (!client->service_is_ready()) {
+                    return;
+                }
+                auto request = std::make_shared<mavros_msgs::srv::SetMode::Request>();
+                request->custom_mode = "AUTO.LAND";
+                RCLCPP_WARN(logger, "Shutdown: requesting landing");
+                client->async_send_request(request);
+            } catch (const std::exception & error) {
+                RCLCPP_WARN(logger, "Shutdown landing request failed: %s", error.what());
+            }
+        });
 }
 
 ctrl_server::~ctrl_server()
 {
-
+    _node->get_node_base_interface()->get_context()->remove_pre_shutdown_callback(shutdown_callback);
 }
 
 void ctrl_server::heartbeat_timer_callback()
 {
-    if (pose_starto && state_starto)
-    {
-        this->fsm_manager();
-        this->ctrl_pub();
+    if (!pose_starto) {
+        return;
+    }
+    ctrl_pub();
+    if (state_starto) {
+        fsm_manager();
     }
 }
 
@@ -89,20 +110,20 @@ void ctrl_server::fsm_manager()
             fsm = ARMED;
             last_request = get_clock_time();
         }
-            
+
         break;
 
-    case ARMED:        
+    case ARMED:
         if (taking_off())
         {
             fsm = TOOKOFF;
             last_request = get_clock_time();
-        }            
-        
+        }
+
         break;
 
     case TOOKOFF:
-        RCLCPP_INFO(_node->get_logger(), "TAKEOVER/HOVER SUCCESS!");
+        RCLCPP_INFO(_node->get_logger(), "Takeoff complete");
         trajectory_start_time = get_clock_time();
         trajectory_complete = false;
         fsm = MOVE;
@@ -110,18 +131,22 @@ void ctrl_server::fsm_manager()
 
     case MOVE:
         update_trajectory(get_clock_time() - trajectory_start_time);
-        if (trajectory_complete && trajectory_auto_land && !land_requested)
+        if (trajectory_complete && trajectory_auto_land)
         {
-            RCLCPP_INFO(_node->get_logger(), "Trajectory complete; requesting AUTO.LAND");
-            land_requested = true;
+            RCLCPP_INFO(_node->get_logger(), "Requesting landing");
             land();
             fsm = LAND;
         }
         break;
 
     case LAND:
+        if (mavlink_state.mode != "AUTO.LAND" &&
+            get_clock_time() - last_request >= kRequestInterval)
+        {
+            land();
+        }
         break;
-    
+
     default:
         break;
     }
@@ -130,10 +155,16 @@ void ctrl_server::fsm_manager()
 
 void ctrl_server::load_trajectory_parameters()
 {
-    trajectory_name = _node->declare_parameter<std::string>("trajectory.type", "circle");
+    trajectory_name = _node->declare_parameter<std::string>("trajectory.type", "hover");
     std::transform(
-        trajectory_name.begin(), trajectory_name.end(), trajectory_name.begin(),
-        [](unsigned char character) { return static_cast<char>(std::tolower(character)); });
+        trajectory_name.begin(),
+        trajectory_name.end(),
+        trajectory_name.begin(),
+        [](unsigned char character)
+        {
+            return static_cast<char>(std::tolower(character));
+        }
+    );
 
     trajectory_repeat_count = _node->declare_parameter<int>("trajectory.repeat_count", 1);
     trajectory_start_delay = _node->declare_parameter<double>("trajectory.start_delay", 1.0);
@@ -164,7 +195,11 @@ void ctrl_server::load_trajectory_parameters()
     step_z = _node->declare_parameter<double>("step.z", 0.0);
     step_hold_time = _node->declare_parameter<double>("step.hold_time", 2.0);
 
-    if (trajectory_name == "circle")
+    if (trajectory_name == "hover")
+    {
+        trajectory_type = TrajectoryType::HOVER;
+    }
+    else if (trajectory_name == "circle")
     {
         trajectory_type = TrajectoryType::CIRCLE;
     }
@@ -185,7 +220,7 @@ void ctrl_server::load_trajectory_parameters()
     else
     {
         throw std::invalid_argument(
-            "trajectory.type must be circle, lemniscate, square, or step");
+            "trajectory.type must be hover, circle, lemniscate, square, or step");
     }
 
     if (trajectory_repeat_count < 1)
@@ -216,16 +251,21 @@ void ctrl_server::load_trajectory_parameters()
         throw std::invalid_argument("step.hold_time must be positive");
     }
 
-    RCLCPP_INFO(
-        _node->get_logger(), "Configured %s trajectory (%d repetition%s, auto_land=%s)",
-        trajectory_name.c_str(), trajectory_repeat_count,
-        trajectory_repeat_count == 1 ? "" : "s", trajectory_auto_land ? "true" : "false");
+    if (trajectory_type == TrajectoryType::HOVER) {
+        RCLCPP_INFO(_node->get_logger(), "Trajectory: hover");
+    } else {
+        RCLCPP_INFO(_node->get_logger(), "Trajectory: %s (repeats=%d, auto_land=%s)",
+            trajectory_name.c_str(), trajectory_repeat_count,
+            trajectory_auto_land ? "true" : "false");
+    }
 }
 
 double ctrl_server::trajectory_cycle_duration() const
 {
     switch (trajectory_type)
     {
+    case TrajectoryType::HOVER:
+        return 0.0;
     case TrajectoryType::CIRCLE:
         return circle_period;
     case TrajectoryType::LEMNISCATE:
@@ -240,7 +280,7 @@ double ctrl_server::trajectory_cycle_duration() const
 
 void ctrl_server::update_trajectory(double elapsed_seconds)
 {
-    if (elapsed_seconds < trajectory_start_delay)
+    if (trajectory_type == TrajectoryType::HOVER || elapsed_seconds < trajectory_start_delay)
     {
         pose_desired.pose.position.x = hover_start_pt.x();
         pose_desired.pose.position.y = hover_start_pt.y();
@@ -254,8 +294,7 @@ void ctrl_server::update_trajectory(double elapsed_seconds)
     const bool just_completed = !trajectory_complete && trajectory_elapsed >= total_duration;
     trajectory_complete = trajectory_elapsed >= total_duration;
 
-    // All four paths finish at their start point. Pinning the phase to zero after
-    // completion prevents a timer overrun from leaving a small endpoint error.
+    // Pin completed paths to their final hold point.
     const double cycle_elapsed = trajectory_complete
         ? 0.0
         : std::fmod(std::max(0.0, trajectory_elapsed), cycle_duration);
@@ -266,6 +305,8 @@ void ctrl_server::update_trajectory(double elapsed_seconds)
 
     switch (trajectory_type)
     {
+    case TrajectoryType::HOVER:
+        return;
     case TrajectoryType::CIRCLE:
     {
         double theta = kTwoPi * cycle_elapsed / circle_period;
@@ -329,59 +370,61 @@ void ctrl_server::update_trajectory(double elapsed_seconds)
     if (just_completed)
     {
         RCLCPP_INFO(
-            _node->get_logger(), "%s trajectory completed", trajectory_name.c_str());
+            _node->get_logger(), "Trajectory complete");
     }
 }
 
 void ctrl_server::pose_callback(geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
 {
-    if (!pose_starto)
-        pose_starto = true;
-
     pose_feedback = *msg;
-    current_pose_SE3 = posemsg_to_SE3(pose_feedback);
-    // std::cout<<cur
+    if (!pose_starto) {
+        set_prerequisite();
+        pose_starto = true;
+    }
 }
 
 void ctrl_server::state_callback(mavros_msgs::msg::State::ConstSharedPtr msg)
 {
-    if (!state_starto)
-        state_starto = true;
-
     mavlink_state = *msg;
+    state_starto = true;
 }
 
 bool ctrl_server::get_ready()
 {
-    switch_to_offboard_mode();
-    arm();
-
-    return mavlink_state.armed;
+    if (!mavlink_state.connected) {
+        return false;
+    }
+    if (mavlink_state.mode == "OFFBOARD" && mavlink_state.armed) {
+        return true;
+    }
+    const double now = get_clock_time();
+    // Stream setpoints before OFFBOARD; limit service retries to one every two seconds.
+    if (now - last_request < kRequestInterval) {
+        return false;
+    }
+    if (mavlink_state.mode != "OFFBOARD") {
+        if (!set_mode_client->service_is_ready()) {
+            return false;
+        }
+        switch_to_offboard_mode();
+    } else {
+        if (!arming_client->service_is_ready()) {
+            return false;
+        }
+        arm();
+    }
+    last_request = now;
+    return false;
 }
 
 bool ctrl_server::taking_off()
 {
-    if (
-        Eigen::Vector3d(
-            (hover_start_pt - current_pose_SE3.translation())
-        ).norm() < 0.1
-    )
-        return true;
-    else
-        return false;
+    const auto & position = pose_feedback.pose.position;
+    return (hover_start_pt - Eigen::Vector3d(position.x, position.y, position.z)).norm() < 0.1;
 }
 
 void ctrl_server::set_prerequisite()
 {
-    rclcpp::Rate rate(10);
-    while (rclcpp::ok()) {
-        std::cout<<"hi"<<std::endl;
-        rclcpp::spin_some(_node);
-        if (pose_starto)
-            break;
-        rate.sleep();
-    }
-
     last_request = get_clock_time();
     pose_desired.pose.position.x = pose_feedback.pose.position.x;
     pose_desired.pose.position.y = pose_feedback.pose.position.y;
@@ -396,7 +439,8 @@ void ctrl_server::set_prerequisite()
         pose_desired.pose.position.y,
         pose_desired.pose.position.z
     );
-    std::cout<<"HOVER AT - \n"<<hover_start_pt<<std::endl;
+    RCLCPP_INFO(_node->get_logger(), "Hover target: (%.3f, %.3f, %.3f) m",
+        hover_start_pt.x(), hover_start_pt.y(), hover_start_pt.z());
 }
 
 void ctrl_server::ctrl_pub()
@@ -406,36 +450,20 @@ void ctrl_server::ctrl_pub()
     pose_desired_pub->publish(pose_desired);
 }
 
-Sophus::SE3d ctrl_server::posemsg_to_SE3(const geometry_msgs::msg::PoseStamped& pose)
-{
-    return Sophus::SE3d(
-        Eigen::Quaterniond(
-            pose.pose.orientation.w,
-            pose.pose.orientation.x,
-            pose.pose.orientation.y,
-            pose.pose.orientation.z  
-        ).normalized().toRotationMatrix(),
-        Eigen::Translation3d(
-            pose.pose.position.x,
-            pose.pose.position.y,
-            pose.pose.position.z
-        ).translation()
-    );
-}
-
 void ctrl_server::arm()
 {
     auto request = std::make_shared<mavros_msgs::srv::CommandBool::Request>();
     request->value = true;
 
+    arming_client->prune_pending_requests();
     arming_client->async_send_request(
         request,
-        [this](rclcpp::Client<mavros_msgs::srv::CommandBool>::SharedFuture future) 
+        [this](rclcpp::Client<mavros_msgs::srv::CommandBool>::SharedFuture future)
         {
-            if (future.get()->success) 
-                output_okay_shit("ARM ACCEPTED");
-            else 
-                output_bad_shit("ARM REJECTED");
+            if (future.get()->success)
+                output_okay_shit("Arming accepted");
+            else
+                output_bad_shit("Arming rejected");
         }
     );
 }
@@ -446,21 +474,27 @@ void ctrl_server::switch_to_offboard_mode()
     request->base_mode = 0;
     request->custom_mode = "OFFBOARD";
 
+    set_mode_client->prune_pending_requests();
     set_mode_client->async_send_request(
         request,
-        [this](rclcpp::Client<mavros_msgs::srv::SetMode>::SharedFuture future) 
+        [this](rclcpp::Client<mavros_msgs::srv::SetMode>::SharedFuture future)
         {
-            if (future.get()->mode_sent) 
-                output_okay_shit("OFFBOARD ACCEPTED");
-            else 
-                output_bad_shit("OFFBOARD REJECTED");
+            if (future.get()->mode_sent)
+                output_okay_shit("OFFBOARD request sent");
+            else
+                output_bad_shit("OFFBOARD request rejected");
         }
     );
 }
 
 void ctrl_server::land()
 {
-    auto req = std::make_shared<mavros_msgs::srv::SetMode::Request>();
-    req->custom_mode = "AUTO.LAND";
-    set_mode_client->async_send_request(req);
+    if (!set_mode_client->service_is_ready()) {
+        return;
+    }
+    last_request = get_clock_time();
+    auto request = std::make_shared<mavros_msgs::srv::SetMode::Request>();
+    request->custom_mode = "AUTO.LAND";
+    set_mode_client->prune_pending_requests();
+    set_mode_client->async_send_request(request);
 }

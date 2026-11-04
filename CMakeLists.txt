@@ -57,7 +57,7 @@ install(PROGRAMS
 
 ###################################################################
 install(
-  DIRECTORY launch config
+  DIRECTORY launch
   DESTINATION share/${PROJECT_NAME}/
   PATTERN "__pycache__" EXCLUDE
   PATTERN "*.pyc" EXCLUDE

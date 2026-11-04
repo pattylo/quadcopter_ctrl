@@ -1,0 +1,50 @@
+CTRL_SERVER:
+  ros__parameters:
+    trajectory:
+      # Select a trajectory, then edit its block below.
+      type: hover
+      # Moving paths only.
+      repeat_count: 1
+      start_delay: 1.0
+      # Added to hover.z during moving paths (m).
+      z_offset: 0.0
+      auto_land: false
+
+    # Full MAVROS namespace, e.g. /lala/mavros.
+    mavros_namespace: /mavros
+
+    # Hold initial X/Y indefinitely at absolute local Z (m).
+    # Also the takeoff height for moving paths.
+    hover:
+      z: 1.5
+
+    # X/Y coordinates below are offsets from initial X/Y (m).
+    # Starts at (center_x + radius, center_y).
+    circle:
+      radius: 1.0
+      period: 8.0
+      center_x: -1.0
+      center_y: 0.0
+      clockwise: false
+
+    # Figure eight: x=center_x+A_x*sin(theta), y=center_y+A_y*sin(2*theta).
+    lemniscate:
+      amplitude_x: 1.0
+      amplitude_y: 0.5
+      period: 8.0
+      center_x: 0.0
+      center_y: 0.0
+
+    # Starts at (center_x - side_length/2, center_y - side_length/2).
+    square:
+      side_length: 1.0
+      speed: 0.5
+      center_x: 0.5
+      center_y: 0.5
+
+    # Apply XYZ step for hold_time, then remove it for hold_time (s).
+    step:
+      x: 1.0
+      y: 0.0
+      z: 0.0
+      hold_time: 2.0

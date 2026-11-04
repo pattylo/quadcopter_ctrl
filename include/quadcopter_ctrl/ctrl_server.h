@@ -1,30 +1,16 @@
 #ifndef CTRL_SERVER_H
 #define CTRL_SERVER_H
 
-#include <chrono>
-#include <string>
 #include <memory>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <cstdint>
-#include <fstream>
-#include <iomanip>
+#include <string>
 
 #include "rclcpp/rclcpp.hpp"
-#include <sophus/se3.hpp>
-
-#include <geometry_msgs/msg/point_stamped.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <mavros_msgs/msg/state.hpp>
 #include <mavros_msgs/srv/command_bool.hpp>
 #include <mavros_msgs/srv/set_mode.hpp>
 
 #include <eigen3/Eigen/Dense>
-
-#include <memory>
-#include <deque>
 
 #define IDLE 0
 #define ARMED 1
@@ -37,6 +23,7 @@ class ctrl_server
     private:
         enum class TrajectoryType
         {
+            HOVER,
             CIRCLE,
             LEMNISCATE,
             SQUARE,
@@ -45,23 +32,19 @@ class ctrl_server
 
         // ROS
         std::shared_ptr<rclcpp::Node> _node;
-        rclcpp::QoS qos_live = rclcpp::QoS(rclcpp::KeepLast(1))
-            .best_effort()
-            .durability_volatile();
-
         // fsm
-        rclcpp::TimerBase::SharedPtr heartbeat_timer;                
+        rclcpp::TimerBase::SharedPtr heartbeat_timer;
+        rclcpp::PreShutdownCallbackHandle shutdown_callback;
         int fsm = IDLE;
         bool pose_starto = false;
         bool state_starto = false;
-        double last_request;
+        double last_request = 0.0;
         Eigen::Vector3d hover_start_pt;
         double hover_z = 1.5;
-        Sophus::SE3d current_pose_SE3;
 
         // Trajectory parameters. Planar offsets are relative to hover_start_pt.
-        TrajectoryType trajectory_type = TrajectoryType::CIRCLE;
-        std::string trajectory_name = "circle";
+        TrajectoryType trajectory_type = TrajectoryType::HOVER;
+        std::string trajectory_name = "hover";
         int trajectory_repeat_count = 1;
         double trajectory_start_delay = 1.0;
         double trajectory_z_offset = 0.0;
@@ -74,7 +57,7 @@ class ctrl_server
         bool circle_clockwise = false;
 
         double lemniscate_amplitude_x = 1.0;
-        double lemniscate_amplitude_y = 1.0;
+        double lemniscate_amplitude_y = 0.5;
         double lemniscate_period = 8.0;
         double lemniscate_center_x = 0.0;
         double lemniscate_center_y = 0.0;
@@ -91,7 +74,6 @@ class ctrl_server
 
         double trajectory_start_time = 0.0;
         bool trajectory_complete = false;
-        bool land_requested = false;
 
         void heartbeat_timer_callback();
         void fsm_manager();
@@ -119,20 +101,14 @@ class ctrl_server
         // ctrl
         rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_desired_pub;
         geometry_msgs::msg::PoseStamped pose_desired;
-        
+
         void ctrl_pub();
 
         // mavlink client
         rclcpp::Client<mavros_msgs::srv::CommandBool>::SharedPtr arming_client;
         rclcpp::Client<mavros_msgs::srv::SetMode>::SharedPtr set_mode_client;
-        rclcpp::Client<mavros_msgs::srv::SetMode>::SharedFuture pending_set_mode_fut;
-        rclcpp::Client<mavros_msgs::srv::CommandBool>::SharedFuture pending_arm_fut;
-        
-        // helper
-        rclcpp::Time start_time;
 
-        Sophus::SE3d posemsg_to_SE3(const geometry_msgs::msg::PoseStamped& pose);
-        inline double get_clock_time(){ return _node->get_clock()->now().seconds(); }
+        double get_clock_time() const { return _node->get_clock()->now().seconds(); }
         inline void output_okay_shit(const std::string & lala)
         {
             RCLCPP_INFO(_node->get_logger(), "%s", lala.c_str());
