@@ -1,0 +1,46 @@
+CTRL_SERVER:
+  ros__parameters:
+    # Absolute local-frame takeoff/hover altitude in metres.
+    hover_z: 1.5
+
+    trajectory:
+      # Supported values: circle, lemniscate, square, step.
+      type: circle
+      repeat_count: 1
+      start_delay: 1.0
+      # Added to hover_z while executing the trajectory.
+      z_offset: 0.0
+      auto_land: false
+
+    # XY centres are offsets from the takeoff point. With center_x=-radius,
+    # this circle starts and finishes directly above the takeoff point.
+    circle:
+      radius: 1.0
+      period: 8.0
+      center_x: -1.0
+      center_y: 0.0
+      clockwise: false
+
+    # Gerono figure eight: x=A_x*sin(theta), y=A_y*sin(2*theta).
+    lemniscate:
+      amplitude_x: 1.0
+      amplitude_y: 0.5
+      period: 8.0
+      center_x: 0.0
+      center_y: 0.0
+
+    # The square begins at its lower-left corner. These default centre offsets
+    # place that first/last corner directly above the takeoff point.
+    square:
+      side_length: 1.0
+      speed: 0.5
+      center_x: 0.5
+      center_y: 0.5
+
+    # Each repetition holds the offset for hold_time, then the hover point for
+    # hold_time. XYZ values are offsets from the hover trajectory setpoint.
+    step:
+      x: 1.0
+      y: 0.0
+      z: 0.0
+      hold_time: 2.0
