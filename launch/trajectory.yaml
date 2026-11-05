@@ -13,7 +13,7 @@ CTRL_SERVER:
 
     # Hover only: take off and hold initial X/Y at this MAVROS local Z (m).
     hover:
-      z: 1.5
+      z: 1.5 
 
     # select with trajectory.type: multi_wp. 
     # visit XYZ waypoints in order.
