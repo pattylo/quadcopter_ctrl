@@ -1,8 +1,10 @@
 #ifndef CTRL_SERVER_H
 #define CTRL_SERVER_H
 
+#include <cstddef>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "rclcpp/rclcpp.hpp"
 #include <geometry_msgs/msg/pose_stamped.hpp>
@@ -27,7 +29,8 @@ class ctrl_server
             CIRCLE,
             LEMNISCATE,
             SQUARE,
-            STEP
+            STEP,
+            MULTI_WP
         };
 
         // ROS
@@ -40,14 +43,13 @@ class ctrl_server
         bool state_starto = false;
         double last_request = 0.0;
         Eigen::Vector3d hover_start_pt;
-        double hover_z = 1.5;
+        double takeoff_z = 1.5;
 
-        // Trajectory parameters. Planar offsets are relative to hover_start_pt.
+        // Trajectory parameters. Relative planar offsets use hover_start_pt.
         TrajectoryType trajectory_type = TrajectoryType::HOVER;
         std::string trajectory_name = "hover";
         int trajectory_repeat_count = 1;
         double trajectory_start_delay = 1.0;
-        double trajectory_z_offset = 0.0;
         bool trajectory_auto_land = false;
 
         double circle_radius = 1.0;
@@ -72,6 +74,15 @@ class ctrl_server
         double step_z = 0.0;
         double step_hold_time = 2.0;
 
+        std::string multi_wp_frame = "relative";
+        double multi_wp_z_fix = 1.5;
+        std::vector<double> multi_wp_waypoints;
+        double multi_wp_reach_tolerance = 0.1;
+        double multi_wp_hold_time = 0.0;
+        std::size_t multi_wp_index = 0;
+        int multi_wp_completed_passes = 0;
+        double multi_wp_reached_time = -1.0;
+
         double trajectory_start_time = 0.0;
         bool trajectory_complete = false;
 
@@ -79,6 +90,7 @@ class ctrl_server
         void fsm_manager();
         void load_trajectory_parameters();
         void update_trajectory(double elapsed_seconds);
+        void update_multi_wp(double elapsed_seconds);
         double trajectory_cycle_duration() const;
         bool get_ready();
         bool taking_off();
