@@ -17,11 +17,6 @@ ctrl_server::ctrl_server(
     std::shared_ptr<rclcpp::Node> node
 ): _node(node)
 {
-    hover_z = _node->declare_parameter<double>(
-        "hover.z", _node->declare_parameter<double>("hover_z", 1.5));
-    if (!std::isfinite(hover_z) || hover_z <= 0.0) {
-        throw std::invalid_argument("Hover altitude must be finite and greater than 0.0 metres");
-    }
     load_trajectory_parameters();
 
     auto mavros_namespace = _node->declare_parameter<std::string>("mavros_namespace", "/mavros");
@@ -126,6 +121,9 @@ void ctrl_server::fsm_manager()
         RCLCPP_INFO(_node->get_logger(), "Takeoff complete");
         trajectory_start_time = get_clock_time();
         trajectory_complete = false;
+        multi_wp_index = 0;
+        multi_wp_completed_passes = 0;
+        multi_wp_reached_time = -1.0;
         fsm = MOVE;
         break;
 
@@ -168,15 +166,18 @@ void ctrl_server::load_trajectory_parameters()
 
     trajectory_repeat_count = _node->declare_parameter<int>("trajectory.repeat_count", 1);
     trajectory_start_delay = _node->declare_parameter<double>("trajectory.start_delay", 1.0);
-    trajectory_z_offset = _node->declare_parameter<double>("trajectory.z_offset", 0.0);
     trajectory_auto_land = _node->declare_parameter<bool>("trajectory.auto_land", false);
 
+    const double hover_z = _node->declare_parameter<double>("hover.z", 1.5);
+
+    const double circle_z_fix = _node->declare_parameter<double>("circle.z_fix", 1.5);
     circle_radius = _node->declare_parameter<double>("circle.radius", 1.0);
     circle_period = _node->declare_parameter<double>("circle.period", 8.0);
     circle_center_x = _node->declare_parameter<double>("circle.center_x", -1.0);
     circle_center_y = _node->declare_parameter<double>("circle.center_y", 0.0);
     circle_clockwise = _node->declare_parameter<bool>("circle.clockwise", false);
 
+    const double lemniscate_z_fix = _node->declare_parameter<double>("lemniscate.z_fix", 1.5);
     lemniscate_amplitude_x =
         _node->declare_parameter<double>("lemniscate.amplitude_x", 1.0);
     lemniscate_amplitude_y =
@@ -185,51 +186,76 @@ void ctrl_server::load_trajectory_parameters()
     lemniscate_center_x = _node->declare_parameter<double>("lemniscate.center_x", 0.0);
     lemniscate_center_y = _node->declare_parameter<double>("lemniscate.center_y", 0.0);
 
+    const double square_z_fix = _node->declare_parameter<double>("square.z_fix", 1.5);
     square_side_length = _node->declare_parameter<double>("square.side_length", 1.0);
     square_speed = _node->declare_parameter<double>("square.speed", 0.5);
     square_center_x = _node->declare_parameter<double>("square.center_x", 0.5);
     square_center_y = _node->declare_parameter<double>("square.center_y", 0.5);
 
+    const double step_z_fix = _node->declare_parameter<double>("step.z_fix", 1.5);
     step_x = _node->declare_parameter<double>("step.x", 1.0);
     step_y = _node->declare_parameter<double>("step.y", 0.0);
     step_z = _node->declare_parameter<double>("step.z", 0.0);
     step_hold_time = _node->declare_parameter<double>("step.hold_time", 2.0);
 
+    multi_wp_frame = _node->declare_parameter<std::string>("multi_wp.frame", "relative");
+    multi_wp_z_fix = _node->declare_parameter<double>("multi_wp.z_fix", 1.5);
+    multi_wp_waypoints =
+        _node->declare_parameter<std::vector<double>>("multi_wp.waypoints", std::vector<double>{});
+    multi_wp_reach_tolerance =
+        _node->declare_parameter<double>("multi_wp.reach_tolerance", 0.1);
+    multi_wp_hold_time = _node->declare_parameter<double>("multi_wp.hold_time", 0.0);
+
     if (trajectory_name == "hover")
     {
         trajectory_type = TrajectoryType::HOVER;
+        takeoff_z = hover_z;
     }
     else if (trajectory_name == "circle")
     {
         trajectory_type = TrajectoryType::CIRCLE;
+        takeoff_z = circle_z_fix;
     }
     else if (
         trajectory_name == "lemniscate" || trajectory_name == "heminiscate" ||
         trajectory_name == "figure_eight")
     {
         trajectory_type = TrajectoryType::LEMNISCATE;
+        takeoff_z = lemniscate_z_fix;
     }
     else if (trajectory_name == "square")
     {
         trajectory_type = TrajectoryType::SQUARE;
+        takeoff_z = square_z_fix;
     }
     else if (trajectory_name == "step")
     {
         trajectory_type = TrajectoryType::STEP;
+        takeoff_z = step_z_fix;
+    }
+    else if (trajectory_name == "multi_wp")
+    {
+        trajectory_type = TrajectoryType::MULTI_WP;
+        takeoff_z = multi_wp_z_fix;
     }
     else
     {
         throw std::invalid_argument(
-            "trajectory.type must be hover, circle, lemniscate, square, or step");
+            "trajectory.type must be hover, circle, lemniscate, square, step, or multi_wp");
     }
 
+    if (!std::isfinite(takeoff_z) || takeoff_z <= 0.0)
+    {
+        throw std::invalid_argument(
+            trajectory_name + " takeoff altitude must be finite and greater than 0.0 metres");
+    }
     if (trajectory_repeat_count < 1)
     {
         throw std::invalid_argument("trajectory.repeat_count must be at least 1");
     }
-    if (trajectory_start_delay < 0.0)
+    if (!std::isfinite(trajectory_start_delay) || trajectory_start_delay < 0.0)
     {
-        throw std::invalid_argument("trajectory.start_delay cannot be negative");
+        throw std::invalid_argument("trajectory.start_delay must be finite and nonnegative");
     }
     if (circle_radius <= 0.0 || circle_period <= 0.0)
     {
@@ -250,6 +276,31 @@ void ctrl_server::load_trajectory_parameters()
     {
         throw std::invalid_argument("step.hold_time must be positive");
     }
+    if (trajectory_type == TrajectoryType::MULTI_WP)
+    {
+        if (multi_wp_frame != "relative" && multi_wp_frame != "absolute")
+        {
+            throw std::invalid_argument("multi_wp.frame must be relative or absolute");
+        }
+        if (multi_wp_waypoints.empty() || multi_wp_waypoints.size() % 3 != 0)
+        {
+            throw std::invalid_argument(
+                "multi_wp.waypoints must contain XYZ triples: [x1, y1, z1, x2, y2, z2, ...]");
+        }
+        if (!std::all_of(multi_wp_waypoints.begin(), multi_wp_waypoints.end(),
+            [](double coordinate) { return std::isfinite(coordinate); }))
+        {
+            throw std::invalid_argument("multi_wp.waypoints coordinates must be finite");
+        }
+        if (!std::isfinite(multi_wp_reach_tolerance) || multi_wp_reach_tolerance <= 0.0)
+        {
+            throw std::invalid_argument("multi_wp.reach_tolerance must be finite and positive");
+        }
+        if (!std::isfinite(multi_wp_hold_time) || multi_wp_hold_time < 0.0)
+        {
+            throw std::invalid_argument("multi_wp.hold_time must be finite and nonnegative");
+        }
+    }
 
     if (trajectory_type == TrajectoryType::HOVER) {
         RCLCPP_INFO(_node->get_logger(), "Trajectory: hover");
@@ -265,6 +316,7 @@ double ctrl_server::trajectory_cycle_duration() const
     switch (trajectory_type)
     {
     case TrajectoryType::HOVER:
+    case TrajectoryType::MULTI_WP:
         return 0.0;
     case TrajectoryType::CIRCLE:
         return circle_period;
@@ -288,6 +340,12 @@ void ctrl_server::update_trajectory(double elapsed_seconds)
         return;
     }
 
+    if (trajectory_type == TrajectoryType::MULTI_WP)
+    {
+        update_multi_wp(elapsed_seconds);
+        return;
+    }
+
     const double cycle_duration = trajectory_cycle_duration();
     const double trajectory_elapsed = elapsed_seconds - trajectory_start_delay;
     const double total_duration = cycle_duration * trajectory_repeat_count;
@@ -301,11 +359,12 @@ void ctrl_server::update_trajectory(double elapsed_seconds)
 
     double relative_x = 0.0;
     double relative_y = 0.0;
-    double relative_z = trajectory_z_offset;
+    double relative_z = 0.0;
 
     switch (trajectory_type)
     {
     case TrajectoryType::HOVER:
+    case TrajectoryType::MULTI_WP:
         return;
     case TrajectoryType::CIRCLE:
     {
@@ -374,6 +433,63 @@ void ctrl_server::update_trajectory(double elapsed_seconds)
     }
 }
 
+void ctrl_server::update_multi_wp(double elapsed_seconds)
+{
+    const std::size_t offset = 3 * multi_wp_index;
+    pose_desired.pose.position.x = multi_wp_waypoints[offset];
+    pose_desired.pose.position.y = multi_wp_waypoints[offset + 1];
+    pose_desired.pose.position.z = multi_wp_waypoints[offset + 2];
+    if (multi_wp_frame == "relative")
+    {
+        pose_desired.pose.position.x += hover_start_pt.x();
+        pose_desired.pose.position.y += hover_start_pt.y();
+        pose_desired.pose.position.z += multi_wp_z_fix;
+    }
+
+    if (trajectory_complete)
+    {
+        return;
+    }
+
+    const auto & target = pose_desired.pose.position;
+    const auto & position = pose_feedback.pose.position;
+    const double distance = Eigen::Vector3d(
+        target.x - position.x, target.y - position.y, target.z - position.z).norm();
+    if (!std::isfinite(distance) || distance > multi_wp_reach_tolerance)
+    {
+        multi_wp_reached_time = -1.0;
+        return;
+    }
+    if (multi_wp_reached_time < 0.0)
+    {
+        multi_wp_reached_time = elapsed_seconds;
+    }
+    if (elapsed_seconds - multi_wp_reached_time < multi_wp_hold_time)
+    {
+        return;
+    }
+
+    const std::size_t waypoint_count = multi_wp_waypoints.size() / 3;
+    RCLCPP_INFO(_node->get_logger(), "Waypoint %zu/%zu reached (pass %d/%d)",
+        multi_wp_index + 1, waypoint_count,
+        multi_wp_completed_passes + 1, trajectory_repeat_count);
+    multi_wp_reached_time = -1.0;
+
+    if (multi_wp_index + 1 < waypoint_count)
+    {
+        ++multi_wp_index;
+    }
+    else if (++multi_wp_completed_passes < trajectory_repeat_count)
+    {
+        multi_wp_index = 0;
+    }
+    else
+    {
+        trajectory_complete = true;
+        RCLCPP_INFO(_node->get_logger(), "Trajectory complete");
+    }
+}
+
 void ctrl_server::pose_callback(geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
 {
     pose_feedback = *msg;
@@ -428,7 +544,7 @@ void ctrl_server::set_prerequisite()
     last_request = get_clock_time();
     pose_desired.pose.position.x = pose_feedback.pose.position.x;
     pose_desired.pose.position.y = pose_feedback.pose.position.y;
-    pose_desired.pose.position.z = hover_z;
+    pose_desired.pose.position.z = takeoff_z;
     pose_desired.pose.orientation.x = 0.0;
     pose_desired.pose.orientation.y = 0.0;
     pose_desired.pose.orientation.z = 0.0;

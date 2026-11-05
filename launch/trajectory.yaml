@@ -1,26 +1,45 @@
 CTRL_SERVER:
   ros__parameters:
     trajectory:
-      # Select a trajectory, then edit its block below.
-      type: hover
+      # Select hover, multi_wp, circle, lemniscate, square, or step.
+      type: multi_wp
       # Moving paths only.
       repeat_count: 1
       start_delay: 1.0
-      # Added to hover.z during moving paths (m).
-      z_offset: 0.0
       auto_land: false
 
     # Full MAVROS namespace, e.g. /lala/mavros.
-    mavros_namespace: /mavros
+    mavros_namespace: /uav0/mavros
 
-    # Hold initial X/Y indefinitely at absolute local Z (m).
-    # Also the takeoff height for moving paths.
+    # Hover only: take off and hold initial X/Y at this MAVROS local Z (m).
     hover:
-      z: 1.5
+      z: 1.5 
+
+    # select with trajectory.type: multi_wp. 
+    # visit XYZ waypoints in order.
+    multi_wp:
+      # Allowed values: "relative" or "absolute" (lowercase).
+
+      # relative: target = (initial_x + x, initial_y + y, z_fix + z).
+      # absolute: target = (x, y, z) in the MAVROS local coordinate frame.
+
+      frame: absolute
+
+      z_fix: 1.2
+      # Flat [x1, y1, z1, x2, y2, z2, ...] in metres; use decimal values.
+      waypoints: [
+        0.0, 0.0, 1.2,
+        1.0, 1.0, 1.2,
+        # 0.0, 1.0, 0.5,
+        # 0.0, 0.0, 0.0
+      ]
+      reach_tolerance: 0.1  # Maximum 3D distance from the target to count as reached (m).
+      hold_time: 1.0        # Continuous time within tolerance before advancing (s).
 
     # X/Y coordinates below are offsets from initial X/Y (m).
     # Starts at (center_x + radius, center_y).
     circle:
+      z_fix: 1.5  # Takeoff and circle altitude in MAVROS local coordinates (m).
       radius: 1.0
       period: 8.0
       center_x: -1.0
@@ -29,6 +48,7 @@ CTRL_SERVER:
 
     # Figure eight: x=center_x+A_x*sin(theta), y=center_y+A_y*sin(2*theta).
     lemniscate:
+      z_fix: 1.5  # Takeoff and figure-eight altitude in MAVROS local coordinates (m).
       amplitude_x: 1.0
       amplitude_y: 0.5
       period: 8.0
@@ -37,14 +57,16 @@ CTRL_SERVER:
 
     # Starts at (center_x - side_length/2, center_y - side_length/2).
     square:
+      z_fix: 1.5  # Takeoff and square altitude in MAVROS local coordinates (m).
       side_length: 1.0
       speed: 0.5
       center_x: 0.5
       center_y: 0.5
 
-    # Apply XYZ step for hold_time, then remove it for hold_time (s).
+    # Apply XYZ offsets for hold_time, then remove them for hold_time (s).
     step:
+      z_fix: 1.5  # Takeoff and base Z in MAVROS local coordinates (m).
       x: 1.0
       y: 0.0
-      z: 0.0
+      z: 0.0     # Vertical offset: target Z alternates between z_fix + z and z_fix.
       hold_time: 2.0
