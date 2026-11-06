@@ -9,7 +9,7 @@ CTRL_SERVER:
       auto_land: false
 
     # Full MAVROS namespace, e.g. /lala/mavros.
-    mavros_namespace: /uav0/mavros
+    mavros_namespace: /mavros
 
     # Hover only: take off and hold initial X/Y at this MAVROS local Z (m).
     hover:
@@ -28,13 +28,13 @@ CTRL_SERVER:
       z_fix: 1.2
       # Flat [x1, y1, z1, x2, y2, z2, ...] in metres; use decimal values.
       waypoints: [
-        0.0, 0.0, 1.2,
-        1.0, 1.0, 1.2,
+        0.0, 0.0, 0.6,
+        0.276, 0.340, 0.6,
         # 0.0, 1.0, 0.5,
         # 0.0, 0.0, 0.0
       ]
       reach_tolerance: 0.1  # Maximum 3D distance from the target to count as reached (m).
-      hold_time: 1.0        # Continuous time within tolerance before advancing (s).
+      hold_time: 4.0        # Continuous time within tolerance before advancing (s).
 
     # X/Y coordinates below are offsets from initial X/Y (m).
     # Starts at (center_x + radius, center_y).
